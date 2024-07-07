@@ -1,5 +1,9 @@
 import numpy as np
 from numpy.lib.stride_tricks import as_strided
+try:
+    from numba import jit
+except ImportError:
+    jit = None
 
 
 def aabb_to_sphere(aabb, /, *, out=None, dtype=None):
@@ -35,76 +39,82 @@ def aabb_to_sphere(aabb, /, *, out=None, dtype=None):
     return out
 
 
-def aabb_transform(aabb, matrix, /, *, out=None, dtype=None):
-    """Apply an affine transformation to an axis-aligned bounding box.
+def aabb_transform(aabb, matrix): #, *, out=None, dtype=None):
+    dtype = np.float32
 
-    Parameters
-    ----------
-    aabb : ndarray, [2, 3]
-        The axis-aligned bounding box.
-    homogeneous_matrix : [4, 4]
-        The homogeneous transformation to apply.
-    out : ndarray, optional
-        A location into which the result is stored. If provided, it
-        must have a shape that the inputs broadcast to. If not provided or
-        None, a freshly-allocated array is returned. A tuple must have
-        length equal to the number of outputs.
-    dtype : data-type, optional
-        Overrides the data type of the result.
-
-    Returns
-    -------
-    aabb : ndarray, [2, 3]
-        The transformed axis-aligned bounding box.
-
-    Notes
-    -----
-    This function preserves the alignment axes of the bounding box. This means
-    the returned bounding box has the same alignment axes as the input bounding
-    box, but contains the transformed object. In other words, the box will grow
-    or shrink depending on how the contained object is transformed, but its
-    alignment axis stay the same.
-
-    """
-
-    aabb = np.asarray(aabb, dtype=float)
-    matrix = np.asarray(matrix, dtype=float).transpose((-1, -2))
-
-    if out is None:
-        out = np.empty_like(aabb, dtype=dtype)
-
-    corners = np.empty((*aabb.shape[:-2], 8, 4), dtype=float)
-    corners[...] = [1, 2, 3, 4]
-    size = corners.itemsize
-
-    corners_x = as_strided(
-        corners[..., 0],
-        shape=(*corners.shape[:-2], 4, 2),
-        strides=(*corners.strides[:-2], 8 * size, 4 * size),
+    compute_dtype = np.float32 # np.promote_types(aabb.dtype, dtype)
+    aabb = np.ascontiguousarray(np.asarray(aabb, dtype=compute_dtype))
+    matrix = np.ascontiguousarray(
+        np.asarray(matrix, dtype=compute_dtype).transpose((-1, -2))
     )
-    corners_x[:] = aabb[..., :, 0]
 
-    corners_y = as_strided(
-        corners[..., 1],
-        shape=(*corners.shape[:-2], 2, 2, 2),
-        strides=(*corners.strides[:-2], 16 * size, 4 * size, 8 * size),
+    out = np.empty_like(aabb, dtype=dtype)
+
+    corners = np.full(
+        aabb.shape[:-2] + (8, 4),
+        fill_value=1.,
+        dtype=compute_dtype,
     )
-    corners_y[:] = aabb[..., :, 1]
 
-    corners_z = as_strided(
-        corners[..., 2],
-        shape=(*corners.shape[:-2], 4, 2),
-        strides=(*corners.strides[:-2], 4 * size, 16 * size),
-    )
-    corners_z[:] = aabb[..., :, 2]
+    corners[..., 0::2, 0] = aabb[..., 0, 0]
+    corners[..., 1::2, 0] = aabb[..., 1, 0]
 
-    corners[..., 3] = 1
+    corners[..., 0::4, 1] = aabb[..., 0, 1]
+    corners[..., 1::4, 1] = aabb[..., 0, 1]
+    corners[..., 2::4, 1] = aabb[..., 1, 1]
+    corners[..., 3::4, 1] = aabb[..., 1, 1]
+
+    corners[..., 0:4, 2] = aabb[..., 0, 2]
+    corners[..., 4:8, 2] = aabb[..., 1, 2]
 
     corners = corners @ matrix
-    out[..., 0, :] = np.min(corners[..., :-1], axis=-2)
-    out[..., 1, :] = np.max(corners[..., :-1], axis=-2)
-
+    out[0, :] = corners[..., :-1].min(axis=-2)
+    out[1, :] = corners[..., :-1].max(axis=-2)
     return out
+
+
+if jit is not None:
+    # A stripped down version of the function that can be compiled with Numba
+    @jit(nopython=True)
+    def aabb_transform(aabb, matrix):
+        dtype = np.float32
+        compute_dtype = np.float32 # np.promote_types(aabb.dtype, dtype)
+
+        aabb = np.ascontiguousarray(np.asarray(aabb, dtype=compute_dtype))
+        matrix = np.ascontiguousarray(
+            np.asarray(matrix, dtype=compute_dtype).transpose((-1, -2))
+        )
+
+        out = np.empty_like(aabb, dtype=dtype)
+
+        corners = np.full(
+            aabb.shape[:-2] + (8, 4),
+            fill_value=1.,
+            dtype=compute_dtype,
+        )
+
+        corners[..., 0::2, 0] = aabb[..., 0, 0]
+        corners[..., 1::2, 0] = aabb[..., 1, 0]
+
+        corners[..., 0::4, 1] = aabb[..., 0, 1]
+        corners[..., 1::4, 1] = aabb[..., 0, 1]
+        corners[..., 2::4, 1] = aabb[..., 1, 1]
+        corners[..., 3::4, 1] = aabb[..., 1, 1]
+
+        corners[..., 0:4, 2] = aabb[..., 0, 2]
+        corners[..., 4:8, 2] = aabb[..., 1, 2]
+
+        corners = corners @ matrix
+        # out[0, :] = corners[..., :-1].min(axis=-2)
+        # out[1, :] = corners[..., :-1].max(axis=-2)
+        # return out
+        # Numba doesn't support the axis argument for min and max,
+        # so we implement it manually
+        for i in range(out.shape[-1]):
+            out[0, i] = np.min(corners[..., i])
+            out[1, i] = np.max(corners[..., i])
+
+        return out
 
 
 def quat_to_axis_angle(quaternion, /, *, out=None, dtype=None):
